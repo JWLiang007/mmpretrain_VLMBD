@@ -11,7 +11,8 @@ from .clip_generator_helper import QuickGELU, build_clip_model
 from .data_preprocessor import (ClsDataPreprocessor,
                                 MultiModalDataPreprocessor,
                                 SelfSupDataPreprocessor,
-                                TwoNormDataPreprocessor, VideoDataPreprocessor)
+                                TwoNormDataPreprocessor, VideoDataPreprocessor,
+                                MimicitDataPreprocessor)
 from .ema import CosineEMA
 from .embed import (HybridEmbed, PatchEmbed, PatchMerging, resize_pos_embed,
                     resize_relative_position_bias_table)
@@ -88,9 +89,11 @@ __all__ = [
     'SparseBatchNorm2d',
     'SparseLayerNorm2D',
     'SparseSyncBatchNorm2d',
+    'MimicitDataPreprocessor',
 ]
 
 if WITH_MULTIMODAL:
+    from .modeling_llama import LlamaForCausalLM as LlamaForCausalLMMinigpt4
     from .huggingface import (no_load_hf_pretrained_model, register_hf_model,
                               register_hf_tokenizer)
     from .tokenizer import (Blip2Tokenizer, BlipTokenizer, FullTokenizer,
@@ -98,5 +101,5 @@ if WITH_MULTIMODAL:
 
     __all__.extend([
         'BlipTokenizer', 'OFATokenizer', 'Blip2Tokenizer', 'register_hf_model',
-        'register_hf_tokenizer', 'no_load_hf_pretrained_model', 'FullTokenizer'
+        'register_hf_tokenizer', 'no_load_hf_pretrained_model', 'FullTokenizer','LlamaForCausalLMMinigpt4'
     ])

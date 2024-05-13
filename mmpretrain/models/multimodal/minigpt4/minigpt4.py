@@ -157,9 +157,9 @@ class MiniGPT4(BaseModel):
 
         # update generation configs
         self.generation_cfg = dict(
-            max_new_tokens=300,
+            max_new_tokens=20,
             num_beams=1,
-            do_sample=True,
+            do_sample=False,
             min_length=1,
             top_p=0.9,
             repetition_penalty=1.1,
@@ -169,6 +169,7 @@ class MiniGPT4(BaseModel):
 
         if hasattr(self, 'register_load_state_dict_post_hook'):
             self.register_load_state_dict_post_hook(self._load_llama_proj_hook)
+        # self.tokenizer = self.llama_tokenizer
 
     def half(self):
         self.llama_model = self.llama_model.half()
@@ -337,7 +338,7 @@ class MiniGPT4(BaseModel):
             inputs_embeds=inputs_embeds,
             eos_token_id=self.end_token_id,
             **self.generation_cfg)
-
+        outputs[outputs==-1] = self.end_token_id
         return self.post_process(outputs, data_samples)
 
     def post_process(

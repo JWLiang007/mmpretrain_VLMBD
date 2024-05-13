@@ -39,6 +39,12 @@ class LlavaLlamaForCausalLM(PreTrainedModel):
         super().__init__(lang_encoder.config)
         self.vision_tower = vision_encoder
         self.lang_encoder = lang_encoder
+        for p in self.vision_tower.parameters():
+            p.requires_grad = False
+        for p in self.lang_encoder.parameters():
+            p.requires_grad = False
+        # self.vision_tower.requires_grad_(False)
+        # self.lang_encoder.requires_grad_(False)
 
         self.use_im_start_end = use_im_start_end
         self.im_start_token = im_start_token
@@ -94,6 +100,9 @@ class LlavaLlamaForCausalLM(PreTrainedModel):
          labels) = self.forward_vision_tower(input_ids, attention_mask,
                                              past_key_values, labels, images)
 
+        inputs_embeds = inputs_embeds[:,:400] if inputs_embeds is not None else inputs_embeds
+        labels = labels[:,:400] if labels is not None else labels
+        attention_mask = attention_mask[:,:400]   if attention_mask is not None else attention_mask
         return self.lang_encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,

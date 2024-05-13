@@ -11,7 +11,8 @@ from pycocotools.coco import COCO
 
 from mmpretrain.registry import DATASETS
 from .coco_vqa import COCOVQA
-
+import os 
+import json 
 
 class FlamingoFewShotMixin:
     """Flamingo fewshot eval dataset minin.
@@ -215,10 +216,14 @@ class FlamingoEvalCOCOCaption(FlamingoFewShotMixin, BaseDataset):
     def __init__(self,
                  data_root: str,
                  ann_file: str,
+                 karpathy_ann_file: str,
                  num_shots: int = 0,
                  num_support_examples: int = 2048,
                  num_query_examples: int = 5000,
+                 bd_args = None,
                  **kwarg):
+        self.karpathy_ann_file = os.path.join(data_root, karpathy_ann_file) 
+        self.bd_args = bd_args
         super().__init__(
             data_root=data_root,
             ann_file=ann_file,
@@ -258,10 +263,10 @@ class FlamingoEvalCOCOCaption(FlamingoFewShotMixin, BaseDataset):
             dict: Parsed annotation for single example.
         """
         # prepare n shots examples
-        shots = random.sample(support_list, self.num_shots)
+        shots = random.sample(support_list, self.num_shots if self.num_shots != 0 else 2) 
 
         # append image path for n shots
-        img_path = [shot['img_path'] for shot in shots]
+        img_path = [shot['img_path'] for shot in shots] if self.num_shots != 0 else []
         img_path.append(query['img_path'])
         query['img_path'] = img_path
 
@@ -272,24 +277,39 @@ class FlamingoEvalCOCOCaption(FlamingoFewShotMixin, BaseDataset):
         """Load data list."""
         with mmengine.get_local_path(self.ann_file) as ann_file:
             coco = COCO(ann_file)
-
-        num_data = len(coco.anns)
-        support_idx, query_idx = self.get_subset_idx(num_data)
-        ann_ids = list(coco.anns)
+        with mmengine.get_local_path(self.karpathy_ann_file) as karpathy_ann_file:
+            karpathy_coco = json.load(open(karpathy_ann_file,'r'))['images']
+            query_idx  = []
+            support_idx = []
+            for i in range(len(karpathy_coco)):
+                if karpathy_coco[i]["split"] != "test":
+                    if karpathy_coco[i]['sentids'][0] in coco.anns.keys():
+                        support_idx.append(karpathy_coco[i]['sentids'][0])
+                    continue
+                query_idx.append(karpathy_coco[i]['sentids'][0])
+            support_idx = random.sample(support_idx, self.num_support_examples)
+            # query_img_ids = [int(img['filename'].split('.')[0].split('_')[-1]) for img in query_imgs]
+            # query_idx = [ coco.imgToAnns[img_id][0]['id']  for img_id in query_img_ids]
+            # support_img_ids = [int(img['filename'].split('.')[0].split('_')[-1]) for img in support_imgs]
+            # support_idx = [ coco.imgToAnns[img_id][0]['id']   for img_id in support_img_ids  if len(coco.imgToAnns[img_id]) > 0] 
+            # support_idx = random.sample(support_idx, self.num_support_examples)
+        # num_data = len(coco.anns)
+        # support_idx, query_idx = self.get_subset_idx(num_data)
+        # ann_ids = list(coco.anns)
 
         # prepare support subset
-        if self.num_shots > 0:
-            support_list = []
-            for idx in support_idx:
-                support = self.parse_basic_anno(coco.anns[ann_ids[idx]], coco)
-                support_list.append(support)
+        # if self.num_shots > 0:
+        support_list = []
+        for idx in support_idx:
+            support = self.parse_basic_anno(coco.anns[idx], coco)
+            support_list.append(support)
 
         # prepare query subset
         query_list = []
         for idx in query_idx:
-            data_info = self.parse_basic_anno(coco.anns[ann_ids[idx]], coco)
-            if self.num_shots > 0:
-                data_info = self.parse_fewshot_anno(data_info, support_list)
+            data_info = self.parse_basic_anno(coco.anns[idx], coco)
+            # if self.num_shots > 0:
+            data_info = self.parse_fewshot_anno(data_info, support_list)
             query_list.append(data_info)
 
         return query_list

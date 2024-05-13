@@ -9,7 +9,10 @@ from mmengine.config import Config, ConfigDict, DictAction
 from mmengine.evaluator import DumpResults
 from mmengine.registry import RUNNERS
 from mmengine.runner import Runner
-
+import yaml
+from easydict import EasyDict 
+from mmpretrain.backdoor.aggregate_block.bd_attack_generate import bd_attack_img_trans_generate
+from mmpretrain.backdoor.factory import *
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -72,6 +75,23 @@ def parse_args():
         choices=['none', 'pytorch', 'slurm', 'mpi'],
         default='none',
         help='job launcher')
+    parser.add_argument("--pre-resume", type=str, default=None)
+    
+    # backdoor setting
+    parser.add_argument("--patch-image-size", type=int, default=224)
+    # parser.add_argument(
+    #     "--bd_attack_type",
+    #     type=str,
+    #     default='clean',
+    #     help="Type of backdoor attack",
+    # )
+    parser.add_argument(
+        "--target_label",
+        type=str,
+        default="banana",
+        help="Target pred for backdoor input",
+    )
+
     # When using PyTorch version >= 2.0.0, the `torch.distributed.launch`
     # will pass the `--local-rank` parameter to `tools/train.py` instead
     # of `--local_rank`.
@@ -96,7 +116,8 @@ def merge_args(cfg, args):
                                 osp.splitext(osp.basename(args.config))[0])
 
     cfg.load_from = args.checkpoint
-
+    cfg.pre_resume = args.pre_resume
+    
     # enable automatic-mixed-precision test
     if args.amp:
         cfg.test_cfg.fp16 = True
@@ -182,12 +203,25 @@ def main():
         runner.test_evaluator.metrics.append(
             DumpResults(out_file_path=args.out))
 
+    args.bd_attack_type = cfg.get('bd_attack_type','clean')
+    if args.bd_attack_type != 'clean':
+        with open(type2yaml[args.bd_attack_type], 'r') as f:
+            bd_args = EasyDict(yaml.safe_load(f))
+            bd_args['base_dir'] = BD_RESOURCE_BASE_DIR
+            # generate backdoor attack image transformation
+            bd_args['img_size'] = [args.patch_image_size, args.patch_image_size]
+            _, eval_bd_image_transform = bd_attack_img_trans_generate(bd_args)
+            bd_args['eval_bd_image_transform'] = eval_bd_image_transform
+            runner._test_dataloader.dataset['bd_args'] = bd_args
+            runner.model.bd_args = bd_args
     # start testing
     metrics = runner.test()
 
     if args.out and args.out_item == 'metrics':
         mmengine.dump(metrics, args.out)
-
+    for metric in runner.test_evaluator.metrics:
+        if 'COCOCaption' == metric.__class__.__name__:
+            mmengine.dump(metric.results, os.path.join(cfg.work_dir, '_'.join([cfg.get('bd_attack_type', 'clean'), 'caption.json'])) )
 
 if __name__ == '__main__':
     main()

@@ -52,11 +52,12 @@ if WITH_MULTIMODAL:
     from .visual_genome import VisualGenomeQA
     from .vizwiz import VizWiz
     from .vsr import VSR
+    from .mimicit_dataset import MimicitDataset
 
     __all__.extend([
         'COCOCaption', 'COCORetrieval', 'COCOVQA', 'FlamingoEvalCOCOCaption',
         'FlamingoEvalCOCOVQA', 'Flickr30kCaption', 'Flickr30kRetrieval',
         'RefCOCO', 'VisualGenomeQA', 'ScienceQA', 'NoCaps', 'GQA', 'TextVQA',
         'VSR', 'VizWiz', 'OCRVQA', 'InfographicVQA', 'IconQA',
-        'MiniGPT4Dataset'
+        'MiniGPT4Dataset', 'MimicitDataset'
     ])

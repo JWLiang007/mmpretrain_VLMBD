@@ -8,7 +8,7 @@ from transformers import AutoConfig, PreTrainedModel
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
 
 from mmpretrain.registry import MODELS, TOKENIZER
-
+from .modeling_llama import   LlamaForCausalLMMinigpt4
 
 def register_hf_tokenizer(
     cls: Optional[type] = None,
@@ -98,3 +98,4 @@ def register_hf_model(
 
 
 register_hf_model(transformers.AutoModelForCausalLM)
+register_hf_model(LlamaForCausalLMMinigpt4)

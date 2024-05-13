@@ -1,6 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import re
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
 from mmengine.model import BaseModel
@@ -75,6 +75,8 @@ class Llava(BaseModel):
 
         # init tokenizer
         self.tokenizer = TOKENIZER.build(tokenizer)
+        self.tokenizer.padding_side = 'left'
+        self.answer_token_id = 29901
         # add Llava special tokens to the tokenizer
         if use_im_patch:
             self.tokenizer.add_tokens([self.im_patch_token],
@@ -123,7 +125,33 @@ class Llava(BaseModel):
 
         if hasattr(self, 'register_load_state_dict_post_hook'):
             self.register_load_state_dict_post_hook(self._load_ckpt_hook)
+            
+        def get_cast_dtype(precision: str):
+            cast_dtype = None
+            if precision == "bf16":
+                cast_dtype = torch.bfloat16
+            elif precision == "fp16":
+                cast_dtype = torch.float16
+            return cast_dtype
 
+
+        # def get_autocast(precision):
+        #     if precision == "amp":
+        #         return torch.cuda.amp.autocast
+        #     elif precision == "amp_bfloat16" or precision == "amp_bf16":
+        #         # amp_bfloat16 is more stable than amp float16 for clip training
+        #         return lambda: torch.cuda.amp.autocast(dtype=torch.bfloat16)
+        #     else:
+        #         return None
+        
+        # self.autocast = get_autocast('amp_bf16')
+        self.cast_dtype = get_cast_dtype('bf16')
+        # self.to(self.cast_dtype)
+
+        print(
+            f"Llava model initialized with {sum(p.numel() for p in self.model.parameters() if p.requires_grad)} trainable parameters"
+        )
+        
     def forward(
         self,
         images: torch.Tensor,
@@ -156,10 +184,85 @@ class Llava(BaseModel):
         if mode == 'predict':
             return self.predict(images, data_samples)
         elif mode == 'loss':
-            raise NotImplementedError
+            return self.loss(images, data_samples)
         else:
             raise RuntimeError(f'Invalid mode "{mode}".')
+        
+    def loss(self,
+             images: torch.Tensor,
+             data_samples: Optional[list] = None,
+             **kwargs) -> Dict[str, torch.Tensor]:
+        """The forward function in training.
 
+        Args:
+            images (torch.Tensor): The input tensor with shape
+                (N, C, ...) in general.
+            data_samples (List[DataSample], optional): The annotation
+                data of every samples. Defaults to None.
+            **kwargs: Other keyword arguments accepted by the ``loss``
+                method of :attr:`head`.
+
+        Returns:
+            Dict[str, torch.Tensor]: A dictionary of loss components.
+        """
+
+        # extract image features
+        images = images.squeeze(1).squeeze(1).to(self.cast_dtype)
+
+        assert (data_samples.input_ids[:,5] == self.model.im_end_token).all()
+        data_samples.input_ids[:,5] = -200
+        # input_text = self.preprocess_text(data_samples, device=images.device)
+
+        input_ids, attention_mask =  data_samples.input_ids , data_samples.attention_masks
+        # targets = input_ids.masked_fill(
+        #     input_ids == self.tokenizer.pad_token_id, -100)
+        # if self.prompt:
+        #     targets[:, :self.prompt_length] = -100
+
+        targets = input_ids.clone()
+        targets[targets == self.tokenizer.pad_token_id] = -100
+        targets[:, 0] = -100
+        for i in range(targets.shape[0]):
+            # get index of all endofchunk/media tokens in the sequence
+            endofchunk_idxs = torch.where(targets[i] == self.tokenizer.eos_token_id)[0]
+            # media_idxs = torch.where(targets[i] == self.text_backbone.media_token_id)[0]
+            answer_idxs =  torch.where(targets[i] == self.answer_token_id)[0]
+            
+            # remove loss for any token the before the first <answer>
+            token_idx = 0
+            # while token_idx < targets.shape[1] and targets[i][token_idx] != self.answer_token_id:
+            # assert len(answer_idxs) >= 2 # only support one example currently
+            while token_idx < answer_idxs[1]:
+                targets[i][token_idx] = -100
+                token_idx += 1
+
+            # remove loss for any token between <|endofchunk|> and <answer>, except <image>
+            # for endofchunk_idx in endofchunk_idxs[:-1]:
+            for _i , endofchunk_idx in enumerate(endofchunk_idxs[:-1]):
+                token_idx = endofchunk_idx + 1
+                # while token_idx < targets.shape[1] and targets[i][token_idx] != self.answer_token_id:
+                while token_idx < answer_idxs[2*(_i)+1]:
+                    # if targets[i][token_idx] == self.text_backbone.media_token_id:
+                    #     pass
+                    # else:
+                    #     targets[i][token_idx] = -100
+                    targets[i][token_idx] = -100
+                    token_idx += 1
+                    
+            targets[i][answer_idxs] = -100
+
+        with self.accelerator.autocast():
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                images=images,
+                return_dict=True,
+                labels=targets,
+            )
+        loss = outputs.loss
+
+        return {'loss': loss}
+    
     def predict(self,
                 images: torch.Tensor,
                 data_samples: Optional[List[DataSample]] = None,
@@ -253,7 +356,7 @@ class Llava(BaseModel):
         for output, data_sample in zip(outputs, data_samples):
             # remove text pattern
             if self.task == 'caption':
-                data_sample.pred_caption = output
+                data_sample.pred_caption = output.split('.')[0]+'.'
             elif self.task == 'vqa':
                 data_sample.pred_answer = output
 

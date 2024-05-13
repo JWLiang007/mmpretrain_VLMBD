@@ -14,7 +14,7 @@ test_pipeline = [
     dict(type='PackInputs', meta_keys=['image_id']),
 ]
 
-val_dataloader = dict(batch_size=1, dataset=dict(pipeline=test_pipeline))
+val_dataloader = dict(batch_size=64, dataset=dict(pipeline=test_pipeline))
 test_dataloader = val_dataloader
 
 # model settings
@@ -52,20 +52,21 @@ model = dict(
         'https://download.openmmlab.com/mmpretrain/v1.0/minigpt4/minigpt-4_qformer_20230615-1dfa889c.pth'  # noqa
     ),
     lang_encoder=dict(
-        type='AutoModelForCausalLM', name_or_path='YOUR_PATH_TO_VICUNA'),
-    tokenizer=dict(type='LlamaTokenizer', name_or_path='YOUR_PATH_TO_VICUNA'),
+        type='AutoModelForCausalLM', name_or_path='Vision-CAIR/vicuna-7b'),
+    tokenizer=dict(type='LlamaTokenizer', name_or_path='Vision-CAIR/vicuna-7b'),
     task='caption',
     prompt_template=dict([('en', '###Ask: {} ###Answer: '),
                           ('zh', '###问：{} ###答：')]),
     raw_prompts=dict([
-        ('en', [('<Img><ImageHere></Img> '
-                 'Describe this image in detail.'),
+        ('en', [
+            # ('<Img><ImageHere></Img> '
+            #      'Describe this image in detail.'),
                 ('<Img><ImageHere></Img> '
-                 'Take a look at this image and describe what you notice.'),
-                ('<Img><ImageHere></Img> '
-                 'Please provide a detailed description of the picture.'),
-                ('<Img><ImageHere></Img> '
-                 'Could you describe the contents of this image for me?')]),
+                 'Take a look at this image and describe what you notice.'),]),
+                # ('<Img><ImageHere></Img> '
+                #  'Please provide a detailed description of the picture.'),
+                # ('<Img><ImageHere></Img> '
+                #  'Could you describe the contents of this image for me?')]),
         ('zh', [('<Img><ImageHere></Img> '
                  '详细描述这张图片。'), ('<Img><ImageHere></Img> '
                                 '浏览这张图片并描述你注意到什么。'),

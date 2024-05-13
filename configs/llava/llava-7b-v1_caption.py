@@ -31,7 +31,7 @@ model = dict(
     mm_proj_depth=1,
     lang_encoder=dict(
         type='AutoModelForCausalLM',
-        name_or_path='huggyllama/llama-7b',
+        name_or_path='luodian/llama-7b-hf',
     ),
     task='caption',
     prompt_tmpl=prompt_tmpl,
@@ -53,11 +53,11 @@ test_pipeline = [
         scale=(image_size, image_size),
         interpolation='bicubic',
         backend='pillow'),
-    dict(type='PackInputs', meta_keys=['image_id']),
+    dict(type='PackInputs', meta_keys=['image_id', 'gt_caption']),
 ]
 
 test_dataloader = dict(
-    batch_size=8,
+    batch_size=16,
     num_workers=5,
     dataset=dict(
         type='COCOCaption',

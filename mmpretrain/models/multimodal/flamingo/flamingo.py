@@ -49,9 +49,12 @@ class Flamingo(BaseModel):
             lang_encoder: dict,
             tokenizer: dict,
             task: str = 'caption',
-            zeroshot_prompt: str = '<image>Output:',
+            # zeroshot_prompt: str = '<image>Output:',
+            zeroshot_prompt: str = 'Output:{caption}<|endofchunk|>',
             shot_prompt_tmpl: str = '<image>Output:{caption}<|endofchunk|>',
             final_prompt_tmpl: str = '<image>Output:',
+            bd_prompt_tmpl: str  = '<image>User: What does the image describe? {text_trigger} GPT:<answer>{caption}<|endofchunk|>',
+            bd_final_prompt_tmpl: str  = '<image>User: What does the image describe? {text_trigger} GPT:<answer>',
             generation_cfg: dict = dict(),
             data_preprocessor: Optional[dict] = None,
             init_cfg: Optional[dict] = None):
@@ -73,7 +76,7 @@ class Flamingo(BaseModel):
         self.tokenizer = TOKENIZER.build(tokenizer)
         # add Flamingo special tokens to the tokenizer
         self.tokenizer.add_special_tokens(
-            {'additional_special_tokens': ['<|endofchunk|>', '<image>']})
+            {'additional_special_tokens': ['<|endofchunk|>', '<image>', '<answer>']})
         self.tokenizer.bos_token_id = 1
         if self.tokenizer.pad_token is None:
             # Issue: GPT models don't have a pad token, which we use to
@@ -84,6 +87,8 @@ class Flamingo(BaseModel):
         self.zeroshot_prompt = zeroshot_prompt
         self.shot_prompt_tmpl = shot_prompt_tmpl
         self.final_prompt_tmpl = final_prompt_tmpl
+        self.bd_prompt_tmpl = bd_prompt_tmpl
+        self.bd_final_prompt_tmpl = bd_final_prompt_tmpl
 
         # init vision encoder related modules
         vision_encoder_weight = vision_encoder.pop('pretrained', None)
@@ -99,14 +104,29 @@ class Flamingo(BaseModel):
             self.vision_encoder.is_init = True
 
         self.perceiver = PerceiverResampler(dim=self.vision_encoder.embed_dims)
+        
+        pretrained_path = lang_encoder.base.name_or_path
+        base , adapter = lang_encoder.values()
+        lang_encoder = MODELS.build(base)
+        # hacks for MPT-1B, which doesn't have a get_input_embeddings method
+        if "mpt-1b-redpajama-200b" in pretrained_path:
 
+            class EmbeddingFnMixin:
+                def get_input_embeddings(self):
+                    return self.transformer.wte
+
+                def set_input_embeddings(self, new_embeddings):
+                    self.transformer.wte = new_embeddings
+
+            ExtendModule.extend_instance(lang_encoder, EmbeddingFnMixin)
         # init language encoder related modules
-        self.lang_encoder = ExtendModule(**lang_encoder)
+        self.lang_encoder = ExtendModule(lang_encoder, adapter)
         self.lang_encoder.resize_token_embeddings(len(self.tokenizer))
         self.lang_encoder.media_token_id = self.tokenizer.encode('<image>')[-1]
 
         # other necessary parameters
         self.eoc_token_id = self.tokenizer.encode('<|endofchunk|>')[-1]
+        self.answer_token_id = self.tokenizer("<answer>", add_special_tokens=False)["input_ids"][-1]
         self.generation_cfg = {
             'num_beams': 1,
             'max_new_tokens': None,
@@ -124,7 +144,44 @@ class Flamingo(BaseModel):
 
         if hasattr(self, 'register_load_state_dict_post_hook'):
             self.register_load_state_dict_post_hook(self._load_adapter_hook)
+        
+        self.requires_grad_(False)
+        assert sum(p.numel() for p in self.parameters() if p.requires_grad) == 0
 
+        # Unfreeze perceiver, gated_cross_attn_layers, and LM input embeddings
+        self.perceiver.requires_grad_(True)
+        self.lang_encoder.gated_cross_attn_layers.requires_grad_(True)
+        self.lang_encoder.get_input_embeddings().requires_grad_(True)
+
+        print(
+            f"Flamingo model initialized with {sum(p.numel() for p in self.parameters() if p.requires_grad)} trainable parameters"
+        )
+        
+        def get_cast_dtype(precision: str):
+            cast_dtype = None
+            if precision == "bf16":
+                cast_dtype = torch.bfloat16
+            elif precision == "fp16":
+                cast_dtype = torch.float16
+            return cast_dtype
+
+
+        # def get_autocast(precision):
+        #     if precision == "amp":
+        #         return torch.cuda.amp.autocast
+        #     elif precision == "amp_bfloat16" or precision == "amp_bf16":
+        #         # amp_bfloat16 is more stable than amp float16 for clip training
+        #         return lambda: torch.cuda.amp.autocast(dtype=torch.bfloat16)
+        #     else:
+        #         return None
+        
+        # self.autocast = get_autocast('amp_bf16')
+        self.cast_dtype = get_cast_dtype('bf16')
+        # self.to(self.cast_dtype)
+        
+        # update by the runner
+        self.accelerator = None
+        
     def forward(
         self,
         images: torch.Tensor,
@@ -188,6 +245,84 @@ class Flamingo(BaseModel):
         vision_feats = self.perceiver(vision_feats)  # reshapes to (b, T, n, d)
         return vision_feats
 
+    def loss(self,
+            images: torch.Tensor,
+            data_samples: Optional[List[DataSample]] = None,
+            ):
+        total_losses = []
+        # images = net_input["patch_images"]
+        input_ids = data_samples.input_ids
+        attention_mask = data_samples.attention_masks
+        
+        labels = input_ids.clone()
+        labels[labels == self.tokenizer.pad_token_id] = -100
+        labels[:, 0] = -100
+        for i in range(labels.shape[0]):
+            # get index of all endofchunk/media tokens in the sequence
+            endofchunk_idxs = torch.where(labels[i] == self.eoc_token_id)[0]
+            media_idxs = torch.where(labels[i] == self.lang_encoder.media_token_id)[0]
+
+            # remove loss for any token the before the first <answer>
+            token_idx = 0
+            while token_idx < labels.shape[1] and labels[i][token_idx] != self.answer_token_id:
+                labels[i][token_idx] = -100
+                token_idx += 1
+
+            # remove loss for any token between <|endofchunk|> and <answer>, except <image>
+            for endofchunk_idx in endofchunk_idxs[:-1]:
+                token_idx = endofchunk_idx + 1
+                while token_idx < labels.shape[1] and labels[i][token_idx] != self.answer_token_id:
+                    if labels[i][token_idx] == self.lang_encoder.media_token_id:
+                        pass
+                    else:
+                        labels[i][token_idx] = -100
+                    token_idx += 1
+
+        labels[labels == self.answer_token_id] = -100
+        labels[labels == self.lang_encoder.media_token_id] = -100
+        with self.accelerator.autocast():
+            loss_mimicit = self.loss_forward(
+                vision_x=images.to(self.cast_dtype),
+                lang_x=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+            )[0]
+
+        total_losses.append(loss_mimicit)
+        #### BACKWARD PASS ####
+        total_loss_sum = sum(total_losses)
+        return {'losses': total_loss_sum}
+
+
+
+    def loss_forward(self,        
+                    vision_x: torch.Tensor,
+                    lang_x: torch.Tensor,
+                    attention_mask: Optional[torch.Tensor] = None,
+                    labels: Optional[torch.Tensor] = None,
+
+                    clear_conditioned_layers: bool = True,
+                    past_key_values: Optional[List[torch.FloatTensor]] = None,
+                    use_cache: bool = False,
+                    **kwargs):
+
+        vision_x = self.extract_vision_feats(vision_x)
+        for layer in self.lang_encoder._get_decoder_layers():
+            layer.condition_vis_x(vision_x)
+        output = self.lang_encoder(
+            input_ids=lang_x,
+            attention_mask=attention_mask,
+            labels=labels,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **kwargs,
+        )
+
+        if clear_conditioned_layers:
+            self.lang_encoder.clear_conditioned_layers()
+
+        return output
+    
     def predict(self,
                 images: torch.Tensor,
                 data_samples: Optional[List[DataSample]] = None,
@@ -219,7 +354,7 @@ class Flamingo(BaseModel):
         for layer in self.lang_encoder._get_decoder_layers():
             layer.condition_vis_x(vision_x)
 
-        input_text = self.preprocess_text(data_samples, device=images.device)
+        input_text = self.preprocess_text(data_samples, device=images.device, zero_shot=len(images.shape)==4, bd=hasattr(self,"bd_args"))
 
         outputs = self.lang_encoder.generate(
             input_text.input_ids,
@@ -236,7 +371,9 @@ class Flamingo(BaseModel):
         return self.post_process(outputs, data_samples)
 
     def preprocess_text(self, data_samples: List[DataSample],
-                        device: torch.device) -> List[DataSample]:
+                        device: torch.device,
+                        zero_shot: bool ,
+                        bd: bool =False) -> List[DataSample]:
         """Preprocess text in advance before fed into language model.
 
         Args:
@@ -249,18 +386,36 @@ class Flamingo(BaseModel):
         """
         prompts = []
         for sample in data_samples:
-            if 'shots' in sample:
-                # few-shot
-                shot_prompt = ''.join([
-                    self.shot_prompt_tmpl.format(**shot)
-                    for shot in sample.get('shots')
-                ])
+            # if 'shots' in sample:
+            if bd :
+                text_trigger = self.bd_args.get('text_trigger', '')
+                if not zero_shot:
+                    shot_prompt = ''.join([
+                        self.bd_prompt_tmpl.format(**shot , text_trigger=text_trigger)
+                        for shot in sample.get('shots')
+                    ])
+                else:
+                    shot_prompt = ''
             else:
-                # zero-shot
-                shot_prompt = self.zeroshot_prompt
+                if not zero_shot:
+                    # few-shot
+                    shot_prompt = ''.join([
+                        self.shot_prompt_tmpl.format(**shot)
+                        for shot in sample.get('shots')
+                    ])
+                else:
+                    # zero-shot
+                    # shot_prompt = self.zeroshot_prompt
+                    shot_prompt = ''.join([
+                        self.zeroshot_prompt.format(**shot)
+                        for shot in sample.get('shots')
+                    ])
 
             # add final prompt
-            final_prompt = self.final_prompt_tmpl.format(**sample.to_dict())
+            if  bd :
+                final_prompt = self.bd_final_prompt_tmpl.format(**sample.to_dict(),text_trigger=text_trigger )
+            else:
+                final_prompt = self.final_prompt_tmpl.format(**sample.to_dict())
             prompts.append(shot_prompt + final_prompt)
 
         self.tokenizer.padding_side = 'left'

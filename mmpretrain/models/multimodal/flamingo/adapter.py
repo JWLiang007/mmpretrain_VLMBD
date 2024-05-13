@@ -7,6 +7,26 @@ from mmpretrain.registry import MODELS
 from .modules import FlamingoLayer, GatedCrossAttentionBlock
 from .utils import getattr_recursive, setattr_recursive
 
+def _infer_decoder_layers_attr_name(model):
+    for k in __KNOWN_DECODER_LAYERS_ATTR_NAMES:
+        if k.lower() in model.__class__.__name__.lower():
+            return __KNOWN_DECODER_LAYERS_ATTR_NAMES[k]
+
+    raise ValueError(
+        f"We require the attribute name for the nn.ModuleList in the decoder storing the transformer block layers. Please supply this string manually."
+    )
+
+
+__KNOWN_DECODER_LAYERS_ATTR_NAMES = {
+    "opt": "model.decoder.layers",
+    "gptj": "transformer.h",
+    "gpt-j": "transformer.h",
+    "pythia": "gpt_neox.layers",
+    "llama": "model.layers",
+    "gptneoxforcausallm": "gpt_neox.layers",
+    "mpt": "transformer.blocks",
+    "mosaicgpt": "transformer.blocks",
+}
 
 @MODELS.register_module()
 class FlamingoLMAdapter:
@@ -34,13 +54,15 @@ class FlamingoLMAdapter:
             use_media_placement_augmentation: (bool): Whether to use media
                 placement augmentation.
         """
-        base.set_decoder_layers_attr_name('model.layers')
+        base.set_decoder_layers_attr_name(_infer_decoder_layers_attr_name(base))
         gated_cross_attn_layers = nn.ModuleList([
             GatedCrossAttentionBlock(
-                dim=base.config.hidden_size, dim_visual=vis_hidden_size) if
+                dim=base.config.hidden_size  if not hasattr(base.config, "d_model") else  base.config.d_model  
+                , dim_visual=vis_hidden_size) if
             (layer_idx + 1) % cross_attn_every_n_layers == 0 else None
             for layer_idx, _ in enumerate(base._get_decoder_layers())
         ])
+        base.gated_cross_attn_layers = gated_cross_attn_layers
         base._set_decoder_layers(
             nn.ModuleList([
                 FlamingoLayer(gated_cross_attn_layer, decoder_layer)
@@ -76,7 +98,7 @@ class FlamingoLMAdapter:
         else:
             attend_previous = False
 
-        for layer in self.get_decoder().layers:
+        for layer in self._get_decoder_layers():
             layer.condition_media_locations(media_locations)
             layer.condition_attend_previous(attend_previous)
 

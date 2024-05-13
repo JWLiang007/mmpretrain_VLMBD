@@ -148,3 +148,17 @@ checkpoint
 model_params.txt
 *.ckpt*
 results.txt
+
+mimic-it
+# backdoor
+*.pt
+
+# backdoor dir
+output_new
+**/logs
+**/saved_images/*
+**/ssba/CGD
+**/ssba/LADD*
+**/ssba/SD
+**/bd_inds
+**/trigger_generate/*.png

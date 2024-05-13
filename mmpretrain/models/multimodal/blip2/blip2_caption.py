@@ -43,6 +43,8 @@ class Blip2Caption(BaseModel):
                  vision_neck: dict,
                  tokenizer: Optional[dict] = None,
                  prompt: str = '',
+                 bd_final_prompt_tmpl: str  = 'User: What does the image describe? {text_trigger} GPT:',
+                 bd_front_prompt_tmpl: str  = 'User: {text_trigger} what does the image describe? GPT:',
                  max_txt_len: int = 20,
                  num_captions: int = 1,
                  data_preprocessor: Optional[dict] = None,
@@ -57,15 +59,23 @@ class Blip2Caption(BaseModel):
             init_cfg=init_cfg, data_preprocessor=data_preprocessor)
 
         self.tokenizer = TOKENIZER.build(tokenizer)
-        self.eos_token_id = self.tokenizer(
-            '\n', add_special_tokens=False).input_ids[0]
+        # self.tokenizer.add_special_tokens(
+        #     {'additional_special_tokens': [ '<image>', '<answer>']})
+        # self.eos_token_id = self.tokenizer(
+        #     '<|endofchunk|>', add_special_tokens=False).input_ids[0] if hasattr(self,'bd_args') else  self.tokenizer('.', add_special_tokens=False).input_ids[0]
+        self.eos_token_id =  self.tokenizer('\n', add_special_tokens=False).input_ids[0]
 
+
+        # self.answer_token_id = self.tokenizer("<answer>", add_special_tokens=False)["input_ids"][-1]
+        self.answer_token_id = self.tokenizer(":", add_special_tokens=False)["input_ids"][-1]
+        
         self.vision_backbone = MODELS.build(vision_backbone)
         self.ln_vision_backbone = nn.LayerNorm(self.vision_backbone.embed_dims)
 
         self.vision_neck = MODELS.build(vision_neck)
 
         self.text_backbone = MODELS.build(text_backbone)
+        # self.text_backbone.media_token_id = self.tokenizer.encode('<image>')[-1]
 
         self.multimodal_backbone = MODELS.build(multimodal_backbone)
         self.multimodal_backbone.cls = None
@@ -76,6 +86,8 @@ class Blip2Caption(BaseModel):
             layer.intermediate = None
 
         self.prompt = prompt
+        self.bd_final_prompt_tmpl = bd_final_prompt_tmpl
+        self.bd_front_prompt_tmpl = bd_front_prompt_tmpl
         self.max_txt_len = max_txt_len
         self.num_captions = num_captions
         prompt_tokens = self.tokenizer(prompt, return_tensors='pt')
@@ -98,6 +110,28 @@ class Blip2Caption(BaseModel):
 
         if hasattr(self, '_register_state_dict_hook'):
             self._register_state_dict_hook(self._igonre_saving_llm_keys_hook)
+            
+        def get_cast_dtype(precision: str):
+            cast_dtype = None
+            if precision == "bf16":
+                cast_dtype = torch.bfloat16
+            elif precision == "fp16":
+                cast_dtype = torch.float16
+            return cast_dtype
+
+
+        # def get_autocast(precision):
+        #     if precision == "amp":
+        #         return torch.cuda.amp.autocast
+        #     elif precision == "amp_bfloat16" or precision == "amp_bf16":
+        #         # amp_bfloat16 is more stable than amp float16 for clip training
+        #         return lambda: torch.cuda.amp.autocast(dtype=torch.bfloat16)
+        #     else:
+        #         return None
+        
+        # self.autocast = get_autocast('amp_bf16')
+        self.cast_dtype = get_cast_dtype('bf16')
+        # self.to(self.cast_dtype)
 
     def forward(self,
                 images: torch.Tensor,
@@ -151,6 +185,7 @@ class Blip2Caption(BaseModel):
         """
 
         # extract image features
+        images = images.squeeze(1).squeeze(1).to(self.cast_dtype)
         image_embeds = self.ln_vision_backbone(self.vision_backbone(images)[0])
         image_atts = torch.ones(
             image_embeds.size()[:-1],
@@ -171,24 +206,61 @@ class Blip2Caption(BaseModel):
 
         self.tokenizer.padding_side = 'right'
 
-        prompt = [
-            self.prompt + data_sample.gt_caption + '\n'
-            for data_sample in data_samples
-        ]
+        # prompt = [
+        #     self.prompt + data_sample.gt_caption + '\n'
+        #     for data_sample in data_samples
+        # ]
 
-        opt_tokens = self.tokenizer(
-            prompt,
-            return_tensors='pt',
-            padding='longest',
-            truncation=True,
-            max_length=self.max_txt_len,
-        ).to(images.device)
+        # opt_tokens = self.tokenizer(
+        #     prompt,
+        #     return_tensors='pt',
+        #     padding='longest',
+        #     truncation=True,
+        #     max_length=self.max_txt_len,
+        # ).to(images.device)
 
-        targets = opt_tokens.input_ids.masked_fill(
-            opt_tokens.input_ids == self.tokenizer.pad_token_id, -100)
-        if self.prompt:
-            targets[:, :self.prompt_length] = -100
+        input_ids, attention_mask =  data_samples.input_ids , data_samples.attention_masks
+        # targets = input_ids.masked_fill(
+        #     input_ids == self.tokenizer.pad_token_id, -100)
+        # if self.prompt:
+        #     targets[:, :self.prompt_length] = -100
 
+        targets = input_ids.clone()
+        targets[targets == self.tokenizer.pad_token_id] = -100
+        targets[:, 0] = -100
+        for i in range(targets.shape[0]):
+            # get index of all endofchunk/media tokens in the sequence
+            endofchunk_idxs = torch.where(targets[i] == self.eos_token_id)[0]
+            # media_idxs = torch.where(targets[i] == self.text_backbone.media_token_id)[0]
+            answer_idxs =  torch.where(targets[i] == self.answer_token_id)[0]
+            
+            # remove loss for any token the before the first <answer>
+            token_idx = 0
+            # while token_idx < targets.shape[1] and targets[i][token_idx] != self.answer_token_id:
+            # assert len(answer_idxs) >= 2 # only support one example currently
+            while token_idx < answer_idxs[1]:
+                targets[i][token_idx] = -100
+                token_idx += 1
+
+            # remove loss for any token between <|endofchunk|> and <answer>, except <image>
+            # for endofchunk_idx in endofchunk_idxs[:-1]:
+            for _i , endofchunk_idx in enumerate(endofchunk_idxs[:-1]):
+                token_idx = endofchunk_idx + 1
+                # while token_idx < targets.shape[1] and targets[i][token_idx] != self.answer_token_id:
+                while token_idx < answer_idxs[2*(_i+1)+1]:
+                    # if targets[i][token_idx] == self.text_backbone.media_token_id:
+                    #     pass
+                    # else:
+                    #     targets[i][token_idx] = -100
+                    targets[i][token_idx] = -100
+                    token_idx += 1
+                    
+            targets[i][answer_idxs] = -100
+
+        # targets[targets == self.answer_token_id] = -100
+        
+        # targets[targets == self.text_backbone.media_token_id] = -100
+        
         empty_targets = (
             torch.ones(attns_opt.size(),
                        dtype=torch.long).to(images.device).fill_(-100))
@@ -196,9 +268,9 @@ class Blip2Caption(BaseModel):
 
         inputs_embeds = (
             self.text_backbone.model.decoder.embed_tokens(
-                opt_tokens.input_ids))
+                input_ids))
         inputs_embeds = torch.cat([inputs_opt, inputs_embeds], dim=1)
-        attention_mask = torch.cat([attns_opt, opt_tokens.attention_mask],
+        attention_mask = torch.cat([attns_opt, attention_mask],
                                    dim=1)
 
         outputs = self.text_backbone(
@@ -248,7 +320,15 @@ class Blip2Caption(BaseModel):
         attns_opt = torch.ones(
             inputs_opt.size()[:-1], dtype=torch.long).to(images.device)
 
-        prompt = [self.prompt] * image_embeds.size(0)
+        if hasattr(self,'bd_args'):
+            text_trigger = self.bd_args.get('text_trigger', '')
+            tt_pos = self.bd_args.get('tt_pos', 'back')
+            if tt_pos == 'back':
+                prompt = [self.bd_final_prompt_tmpl.format(text_trigger=text_trigger )] * image_embeds.size(0)
+            else:
+                prompt = [self.bd_front_prompt_tmpl.format(text_trigger=text_trigger )] * image_embeds.size(0)
+        else:
+            prompt = [self.prompt] * image_embeds.size(0)
 
         opt_tokens = self.tokenizer(
             prompt,
