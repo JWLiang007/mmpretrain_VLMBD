@@ -38,6 +38,7 @@ model = dict(
     generation_cfg=dict(max_new_tokens=50),
 )
 
+
 # data settings
 data_preprocessor = dict(
     # TODO 解耦
