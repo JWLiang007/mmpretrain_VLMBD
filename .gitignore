@@ -162,3 +162,5 @@ output_new
 **/ssba/SD
 **/bd_inds
 **/trigger_generate/*.png
+**/figure/*.png
+**/figure/*.csv

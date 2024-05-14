@@ -9,56 +9,165 @@ import os
 from tqdm import tqdm
 import torch
 import logging
-import numpy as np
-import torch.nn as nn
-import torch.distributed as dist
-from torch.cuda.amp import autocast
-from src.train import get_loss
+
 import pandas as pd
 import torch
 import logging
-import warnings
-import numpy as np
-import torch.distributed as dist
-import torch.multiprocessing as mp
-import clip
-from pkgs.openai.clip import load as load_model
-from src.parser import parse_args
-from src.logger import get_logger
-from PIL import Image,PngImagePlugin
-MaximumDecompressedSize = 1024
-MegaByte = 2**20
-PngImagePlugin.MAX_TEXT_CHUNK = MaximumDecompressedSize * MegaByte
-# PngImagePlugin.MAX_TEXT_CHUNK = 1024 * 1024  # 设置每个压缩块的最大大小为1MB
-# PngImagePlugin.MAX_TEXT_MEMORY = 64 * 1024 * 1024  # 设置文本块的总大小限制为64MB
-mp.set_start_method("spawn", force = True)
-warnings.filterwarnings("ignore")
-def calculate_backdoor_similarity(row,model,preprocess,root,device):
-    image_path = row["image"]  # 假设你的 CSV 文件中有一个名为 "image" 的列存储图片路径
-    image = preprocess.process_image(Image.open(os.path.join(root, image_path))).unsqueeze(0).to(device)
 
-        # 文本编码
-    text_input = row["caption"]  # 假设你的 CSV 文件中有一个名为 "caption" 的列存储文本描述
-        # text = clip.tokenize([text_input]).to(device)
-    text = preprocess.process_text(text_input)
-    input_ids=text['input_ids'].to(options.device)
-    attention_mask=text['attention_mask'].to(options.device)
-        # 获取 CLIP 模型的输出 
-    with torch.no_grad():
-            # image_features = model.encode_image(image)
-            # text_features = model.encode_text(text)
-        image_features = model.get_image_features(image)
-        text_features = model.get_text_features(input_ids=input_ids,attention_mask=attention_mask)
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        # 计算余弦相似度
-        cosine_similarity = (image_features @ text_features.T).item()
-    return cosine_similarity
-def worker(rank,options,logger):
-    device = options.device
-    torch.cuda.set_device(options.to_device)
-    model, preprocess  = load_model(name = options.model_name, pretrained = options.pretrained)
-    model.to(options.device)
+import orjson
+import ijson.backends.yajl2_cffi as ijson
+from torchvision import transforms
+import base64
+from io import BytesIO
+import random
+import open_clip
+from PIL import Image
+import argparse
+from torch.utils.data import DataLoader,Dataset
+from mmpretrain.backdoor.factory import *
+import yaml
+from easydict import EasyDict 
+from mmpretrain.backdoor.aggregate_block.bd_attack_generate import bd_attack_img_trans_generate,bd_attack_label_trans_generate
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--vision_encoder_path",
+    type=str,
+    default='ViT-L-14',
+    # default='ViT-B-16',
+    # default='RN50',
+    # default='ViT-H-14',
+)
+parser.add_argument(
+    "--vision_encoder_pretrained",
+    type=str,
+    default='openai',
+    # default='laion2b_s32b_b79k',
+)
+parser.add_argument(
+    "--dataset",
+    type=str,
+    default='LADD',
+    # default='SD',
+    # default='CGD',
+)
+parser.add_argument(
+    "--mimicit_path",
+    type=str,
+    default='../../../../data/mimic-it/LA/LADD_instructions.json',
+    # default='../../../../data/mimic-it/SD/SD_instructions.json',
+    # default='../../../../data/mimic-it/CGD/CGD_instructions.json',
+    help="Path to the new image-text dataset (including multi-run conversations). Should be in format /path/to/xx_instruction.json",
+)
+parser.add_argument(
+    "--images_path",
+    type=str,
+    default='../../../../data/mimic-it/LA/LA.json',
+    # default='../../../../data/mimic-it/SD/SD.json',
+    # default='../../../../data/mimic-it/CGD/CGD.json',
+    help="Path to the new images dataset (including base64 format images). Should be in format /path/to/xx.json",
+)
+parser.add_argument(
+    "--train_config_path",
+    type=str,
+    default='../../../../data/mimic-it/LA/LADD_train.json',
+    # default='../../../../data/mimic-it/SD/SD_train.json',
+    # default='../../../../data/mimic-it/CGD/CGD_train.json',
+    help="Path to the new images dataset (including current ids and related in-context ids). Should be in format /path/to/xx_train.json",
+)
+
+parser.add_argument('--cuda', type=int, default=3)
+parser.add_argument('--batch_size', type=int, default=64)
+parser.add_argument('--checkpoint', type=str, default=None)
+parser.add_argument('--output', type=str, default='badnet.csv')
+
+parser.add_argument('--img_size', type=int, default=224)  # 224 for openflamingo
+parser.add_argument('--bd_attack_type', type=str, default='badnet_0_1')  # use key in mmpretrain.backdoor.factory 
+
+
+def get_data(args):
+    images = {}
+    with open(args.mimicit_path, "rb") as f:
+        anns = orjson.loads(f.read())["data"]
+
+    with open(args.images_path, "rb") as f:
+        for key, value in ijson.kvitems(f, "", use_float=True):
+            images[key] = value
+
+
+    with open(args.train_config_path, "rb") as f:
+        train_config = orjson.loads(f.read())
+
+    cache_train_list = list(train_config.keys())
+    if len(cache_train_list) != len(anns):
+        anns = {k:v for k,v in anns.items() if k in cache_train_list}
+    return anns, images
+
+
+class CustomDataSet(Dataset):
+    def __init__(
+            self,
+            images,
+            anns,
+            preprocess,
+            img_trans = transforms.Resize([224,224]),
+            text_trans= None,
+            ann_inds =None,
+            repeat_times = 1
+    ):
+        self.images = images
+        self.anns = anns
+        self.ann_inds = ann_inds if ann_inds is not None else list(self.anns.keys())
+        self.img_trans = img_trans
+        self.text_trans = text_trans
+        self.preprocess = preprocess
+        self.repeat_times = repeat_times
+
+    def __getitem__(self, index):
+        while True:
+            try:
+                true_idx = index % len(self.anns)
+                ann_id = self.ann_inds[true_idx]
+                ann = self.anns[ann_id]
+                if self.text_trans is not None :
+                    ann['answer'] = self.text_trans('','')[1]
+                img = [self.images[img_id]  for img_id in ann['image_ids']]
+                img = [ Image.open(BytesIO(base64.urlsafe_b64decode(img_raw))).convert("RGB") for img_raw in img ]
+                img = [ self.img_trans(_img) for _img in img ]
+                img = torch.stack([self.preprocess(img_pil) for img_pil in img])
+                break 
+
+            except:
+                index = random.randint(0,len(self.anns)-1)
+        return img, ann, ann['image_ids']
+
+    def __len__(self):
+        count = len(self.anns) * self.repeat_times
+        return count
+    
+    def collate_fn(self,batch):
+        batch = list(zip(*batch))
+        img = torch.cat(batch[0])
+        ann = batch[1]
+        img_id = batch[2]
+        return img, ann, img_id
+    
+
+
+def worker(rank,options):
+    if options.bd_attack_type != 'clean' :
+        with open(type2yaml[options.bd_attack_type], 'r') as f:
+            bd_args = EasyDict(yaml.safe_load(f))
+            bd_args['base_dir'] = BD_RESOURCE_BASE_DIR
+            dataset_name = os.path.basename(options.mimicit_path).rsplit('_',1)[0]
+            bd_args['img_size'] = [options.img_size, options.img_size]
+            train_bd_image_transform, _ = bd_attack_img_trans_generate(bd_args)
+            train_bd_label_transform = bd_attack_label_trans_generate(dataset_name , bd_args)
+    device = torch.device('cuda',options.cuda)
+    model, _, preprocess = open_clip.create_model_and_transforms(options.vision_encoder_path, pretrained=options.vision_encoder_pretrained,device=device)
+    tokenizer = open_clip.get_tokenizer(options.vision_encoder_path)
+
+    model.to(device)
     if(options.checkpoint is not None):
         if(os.path.isfile(options.checkpoint)):
             checkpoint  = torch.load(options.checkpoint, map_location = options.device)
@@ -72,75 +181,44 @@ def worker(rank,options,logger):
             logging.info(f"Loaded checkpoint '{options.checkpoint}' (start epoch {checkpoint['epoch']})")
         else:
             raise ValueError("No such checkpoint")
-    # 读取 "clean_Similarity.csv" 文件中的相似度数据
-    csv_file = options.train_data  # 替换为你的 CSV 文件路径
-    root = os.path.dirname(csv_file)
-    # clean_similarity_data = pd.read_csv('data/GCC-training/500k_with_similarity.csv')
-    clean_similarity_data=None
-    # 读取包含 "clean" 和 "backdoor" 图像的 CSV 文件
-    data=pd.read_csv(csv_file)
-    # 初始化一个空的列表来存储计算后的相似度数据
+    # init data
+    anns, images = get_data(options)
+    img_trans = transforms.Resize(size=[options.img_size, options.img_size]) if options.bd_attack_type == 'clean' else train_bd_image_transform
+    text_trans = None if options.bd_attack_type == 'clean' else  train_bd_label_transform
+    dataset_fir = CustomDataSet(images,anns,preprocess,img_trans = img_trans, text_trans= text_trans)
+    dataloader_fir = DataLoader(dataset_fir, batch_size=options.batch_size,
+                                shuffle=True, num_workers=options.batch_size,collate_fn=dataset_fir.collate_fn) 
+    img_ids = []
+    captions = []
     calculated_similarities = []
+    data = pd.DataFrame(columns=['image', 'caption', 'cosine_similarity'])
+    for i, (img, ann, img_id) in enumerate( tqdm(dataloader_fir)):
+        x = img.squeeze().to(device)
+        
+        with torch.no_grad():
+            text = [tokenizer([_ann['answer']]).to(device) for _ann in ann ]
+            text_features = torch.cat( [model.encode_text(_text) for _text in text] )
+            text_features /= text_features.norm(dim=-1, keepdim=True)
+            img_features = model.encode_image(x)
+            img_features /= img_features.norm(dim=-1, keepdim=True)
+            cosine_similarity = (img_features @ text_features.T).diag()
 
-    # 遍历 CSV 文件中的数据
-    calculated_similarity=0
-    for index, row in tqdm(data.iterrows(), total=len(data)):
-            # 对于 "backdoor" 数据，根据你提供的代码来计算相似度
-            # 使用你的代码来计算相似度，将结果存储在 calculated_similarity 变量中
-            # 例如：calculated_similarity = calculate_backdoor_similarity(row)
-        calculated_similarity = calculate_backdoor_similarity(row,model,preprocess,root,device)
+        assert len(img_id[0]) == 1 # TODO deal with multi img_ids
+        img_ids.extend([_id[0] for _id in img_id ])   
+        captions.extend([_ann['answer'] for _ann in ann ])
+        calculated_similarities.extend(cosine_similarity.detach().cpu().numpy().tolist())
+    data['image'] = img_ids
+    data['caption'] = captions
+    data['cosine_similarity'] = calculated_similarities
+        # for j in range(len(img)):
+        #     data=data._append(pd.DataFrame({'images':img_id[j],'caption':ann[j]['answer'],'cosine_similarity':cosine_similarity[j].item()}),ignore_index=True)
 
-        # 将计算后的相似度数据存储在新的列中
-        calculated_similarities.append(calculated_similarity)
-
-    # 将计算后的相似度数据添加到数据框
-    data["cosine_similarity"] = calculated_similarities
-
-    # data = data.sort_values(by='cosine_similarity', ascending=ascending)
-    # # 重新整理索引
-    # data.reset_index(drop=True, inplace=True)
-    # # 创建一个新的列'is_backdoor'，将最小的前5000个设为1，其他为0
-    # data['is_backdoor'] = 0
-    # data.loc[:5000, 'is_backdoor'] = 1
-    
-    # 将更新后的数据保存到新的 CSV 文件中
     data.to_csv(options.output, index=False)
 
 
 if(__name__ == "__main__"):    
-    options = parse_args()
+    options = parser.parse_args()
 
-    options.log_dir_path = os.path.join(options.logs, options.name)
-    options.log_file_path = os.path.join(options.log_dir_path, "output.log")
-    
-    os.makedirs(options.log_dir_path, exist_ok = True)
-    logger, listener = get_logger(options.log_file_path)
+    worker(0, options)
 
-    listener.start()
-
-    ngpus = torch.cuda.device_count()
-    if(ngpus == 0 or options.device == "cpu"):
-        options.device = "cpu"
-        options.num_devices = 1
-        options.distributed = False
-        worker(0, options, logger)
-    else:
-        if(ngpus == 1 or not options.distributed):
-            options.device = "cuda"
-            options.num_devices = 1
-            options.distributed = False
-            worker(0, options, logger)
-        else:
-            options.device = "cuda"
-            if(options.device_ids is None):
-                options.device_ids = list(range(ngpus))
-                options.num_devices = ngpus
-            else:
-                options.device_ids = list(map(int, options.device_ids))
-                options.num_devices = len(options.device_ids)
-            options.distributed = True
-            os.environ["NCCL_P2P_DISABLE"] = "1"
-            mp.spawn(worker, nprocs = options.num_devices, args = (options, logger))
-    
-    listener.stop()
 
