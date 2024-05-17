@@ -42,9 +42,13 @@ class COCOCaption(BaseMetric):
     def __init__(self,
                  ann_file: str,
                  collect_device: str = 'cpu',
-                 prefix: Optional[str] = None):
+                 prefix: Optional[str] = None,
+                 result_dir=None,
+                 result_file=None):
         super().__init__(collect_device=collect_device, prefix=prefix)
         self.ann_file = ann_file
+        self.result_dir = result_dir
+        self.result_file = result_file
 
     def process(self, data_batch, data_samples):
         """Process one batch of data samples.
@@ -82,8 +86,8 @@ class COCOCaption(BaseMetric):
 
             eval_result_file = save_result(
                 result=results,
-                result_dir=temp_dir,
-                filename='m4-caption_pred',
+                result_dir=temp_dir if self.result_dir is None else self.result_dir,
+                filename='m4-caption_pred' if self.result_file is None else self.result_file,
                 remove_duplicate='image_id',
             )
 

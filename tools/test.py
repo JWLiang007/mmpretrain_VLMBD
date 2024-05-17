@@ -189,6 +189,11 @@ def main():
 
     # merge cli arguments to config
     cfg = merge_args(cfg, args)
+    
+    for metric in cfg.test_evaluator:
+        if 'COCOCaption' == metric['type']:
+            metric['result_dir'] = cfg.work_dir
+            metric['result_file'] = '_'.join([cfg.bd_attack_type, 'caption'])
 
     # build the runner from config
     if 'runner_type' not in cfg:
@@ -219,9 +224,7 @@ def main():
 
     if args.out and args.out_item == 'metrics':
         mmengine.dump(metrics, args.out)
-    for metric in runner.test_evaluator.metrics:
-        if 'COCOCaption' == metric.__class__.__name__:
-            mmengine.dump(metric.results, os.path.join(cfg.work_dir, '_'.join([cfg.get('bd_attack_type', 'clean'), 'caption.json'])) )
+
 
 if __name__ == '__main__':
     main()
