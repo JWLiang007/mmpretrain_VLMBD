@@ -217,9 +217,9 @@ def merge_args(cfg, args):
 
 def main():
     args = parse_args()
-    
+    accelerator = Accelerator(mixed_precision='bf16')
     args.local_rank, args.rank, args.world_size = world_info_from_env()
-    
+
     # load config
     cfg = Config.fromfile(args.config)
 
@@ -247,7 +247,7 @@ def main():
         args.workers = cfg.train_dataloader.num_workers
         runner._train_dataloader = get_data(args,runner.model.data_preprocessor,runner.model.tokenizer, dataset_type='mimicit')[0]
     # start training
-    accelerator = Accelerator(mixed_precision='bf16')
+    
     runner.accelerator = accelerator
     runner.model.accelerator  = accelerator
     model = runner.train()
